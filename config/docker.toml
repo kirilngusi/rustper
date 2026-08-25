@@ -1,0 +1,29 @@
+[sources.kafka_in]
+type = "kafka"
+brokers = "kafka:19092"
+group_id = "rustper-docker"
+topics = ["rustper-input"]
+batch_size = 1000
+batch_linger_ms = 5
+max_in_flight_batches = 8
+max_in_flight_bytes = 268435456
+
+[sinks.analytics]
+type = "kafka"
+inputs = ["kafka_in"]
+brokers = "kafka:19092"
+topic = "rustper-analytics"
+buffer_capacity = 32
+batch_max_events = 10000
+batch_max_bytes = 16777216
+batch_linger_ms = 5
+
+[sinks.archive]
+type = "kafka"
+inputs = ["kafka_in"]
+brokers = "kafka:19092"
+topic = "rustper-archive"
+buffer_capacity = 32
+batch_max_events = 10000
+batch_max_bytes = 16777216
+batch_linger_ms = 5

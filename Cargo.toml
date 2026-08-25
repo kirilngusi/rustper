@@ -1,0 +1,28 @@
+[package]
+name = "rustper"
+version = "0.1.0"
+edition = "2024"
+default-run = "rustper"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.10"
+clickhouse = "0.15.1"
+futures = "0.3"
+rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
+[[bin]]
+name = "kafka-load"
+path = "src/bin/kafka_load.rs"

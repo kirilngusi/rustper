@@ -1,0 +1,30 @@
+[sources.kafka_in]
+type = "kafka"
+brokers = "localhost:9092"
+group_id = "rustper-clickhouse-v1"
+topics = ["rustper-v2-input"]
+batch_size = 1000
+batch_linger_ms = 5
+max_in_flight_batches = 8
+max_in_flight_bytes = 268435456
+
+[sinks.kafka_copy]
+type = "kafka"
+inputs = ["kafka_in"]
+brokers = "localhost:9092"
+topic = "rustper-v2-kafka"
+batch_max_events = 10000
+batch_max_bytes = 16777216
+batch_linger_ms = 5
+
+[sinks.clickhouse]
+type = "clickhouse"
+inputs = ["kafka_in"]
+endpoint = "http://localhost:8123"
+database = "default"
+table = "rustper_events"
+user = "default"
+password = "rustper"
+batch_max_events = 10000
+batch_max_bytes = 16777216
+batch_linger_ms = 50

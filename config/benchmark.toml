@@ -1,0 +1,27 @@
+[sources.kafka_in]
+type = "kafka"
+brokers = "localhost:9092"
+group_id = "rustper-optimized-benchmark-v1"
+topics = ["rustper-optimized-bench-input"]
+batch_size = 1000
+batch_linger_ms = 5
+max_in_flight_batches = 8
+max_in_flight_bytes = 268435456
+
+[sinks.bench_a]
+type = "kafka"
+inputs = ["kafka_in"]
+brokers = "localhost:9092"
+topic = "rustper-optimized-bench-a"
+batch_max_events = 10000
+batch_max_bytes = 16777216
+batch_linger_ms = 5
+
+[sinks.bench_b]
+type = "kafka"
+inputs = ["kafka_in"]
+brokers = "localhost:9092"
+topic = "rustper-optimized-bench-b"
+batch_max_events = 10000
+batch_max_bytes = 16777216
+batch_linger_ms = 5
