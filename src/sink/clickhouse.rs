@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clickhouse::{Client, Row};
@@ -7,7 +9,7 @@ use std::time::Duration;
 
 use crate::{
     config::ClickhouseSinkConfig,
-    event::Event,
+    event::EventBatch,
     sink::{BatchSettings, Sink},
 };
 
@@ -61,13 +63,13 @@ impl Sink for ClickhouseSink {
         self.batch
     }
 
-    async fn write_batches(&mut self, batches: &[&[Event]]) -> Result<()> {
+    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<()> {
         let mut insert = self
             .client
             .insert::<EventRow<'_>>(&self.table)
             .await
             .with_context(|| format!("ClickHouse insert into {:?} failed", self.table))?;
-        for event in batches.iter().flat_map(|batch| batch.iter()) {
+        for event in batches.iter().flat_map(|batch| batch.events()) {
             let row = EventRow {
                 timestamp_ms: event.timestamp_ms.unwrap_or_default(),
                 source_component: &event.source.component_id,
