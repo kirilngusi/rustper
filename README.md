@@ -100,8 +100,19 @@ KAFKA_TOPIC=rustper-input MESSAGE_COUNT=100000 \
 | `cargo run --release --example normalize_ab` | arena copy so với alloc mỗi field |
 | `cargo run --release --bin kafka-load` | load generator cho benchmark end-to-end |
 
-Số end-to-end hiện có trong `docs/PERFORMANCE.md` là **producer-bound và n = 1**;
-§3.5 và §3.6 nói rõ nó chứng minh được gì và đo lại cho đúng bằng cách nào.
+Số đo trong `docs/PERFORMANCE.md` §3, trên Apple M1 Pro với broker chạy trong
+Docker VM cùng máy:
+
+| | End-to-end qua Kafka | In-process (không broker) |
+| --- | --- | --- |
+| Throughput | 348,502 msg/s steady (255,704 average) | 1,028,164 msg/s |
+| Fan-out | ~697,000 deliveries/s | 3,084,493 deliveries/s |
+| CPU | 1.25 core (4.69 CPU-s/triệu msg) | 0.54 core (0.52 CPU-s/triệu msg) |
+| RSS | 195 MiB median, 384 MiB peak | 18 MiB |
+
+Router chiếm 11% ngân sách CPU end-to-end; 89% là librdkafka và broker. §8 liệt
+kê những gì các số này **không** trả lời — không có latency, n = 1, chưa đo trên
+Linux hay bare metal.
 
 Để test ClickHouse, tạo bảng như trong `docs/LEARNING_NOTES.md`, sau đó chạy:
 

@@ -168,48 +168,64 @@ tuần tự (chờ ack từng batch) cho 141,062 msg/s — nó đo sink linger 5
 
 ### 3.4 End-to-end qua Kafka — drain rate, đo 2026-08-29
 
-Đo theo quy trình hai pha ở §3.6: nạp backlog trước, **producer đã dừng hẳn** rồi
+Đo theo quy trình hai pha ở §3.7: nạp backlog trước, **producer đã dừng hẳn** rồi
 mới khởi động router. Topology là `config/resource-benchmark.toml` — 1 input topic
 6 partitions, fan-out ra 2 Kafka topic, `max_concurrent_writes = 1`.
 
-**Run A — backlog 5,000,000, không rebalance:**
+**Run chuẩn — backlog 10,000,000, `session_timeout_ms = 45000`, 0 rebalance:**
 
 ```text
-Drain:              5,000,000 messages in 17.683 s
-Average:            282,761 input msg/s
-Steady interval:    306,620 – 406,765 msg/s
-Logical fanout:     ~565,000 deliveries/s
-Input payload:      ~276 MiB/s in, ~552 MiB/s out
+Drain:              10,000,000 messages in 39.108 s
+Average:            255,704 input msg/s
+Steady interval:    median 348,502 msg/s, p5 91,394, p95 457,105
+Logical fanout:     ~697,000 deliveries/s (2 sink)
+Payload:            ~340 MiB/s in, ~680 MiB/s out (steady)
+
+Router CPU:         median 125.1% of one core   (30 mẫu 1 s)
+                    p5 55.1%, p95 149.1%, max 158.4%
+Router RSS:         median 195.5 MiB  (min 150, peak 384)
+
+Gap lớn nhất giữa 2 report: 1.15 s  → không có stall
+Rebalance trong lúc chạy:   0
 ```
 
-**Run B — backlog 15,000,000, có 4 rebalance:**
+Quy ra chi phí CPU, ghép đúng cửa sổ lấy mẫu (t = 2.13 s → 31.75 s, 7,900,248
+messages trong 29.62 s = 266,719 msg/s):
 
 ```text
-Overall:            15,002,257 messages in 108.285 s = 138,544 msg/s
-Steady interval:    median 343,473 msg/s, p95 457,082, max 485,367
-Router RSS:         median 141.0 MiB (min 132, peak 308)
-Kafka container:    median 23.9% CPU, 925 MiB
+1.251 core / 266,719 msg/s × 1,000,000
+≈ 4.69 CPU-seconds trên mỗi triệu input messages
 ```
 
-Run B chứa **một stall 25 giây** (t=16 s → 41 s) kéo trung bình từ ~343k xuống
-138k. Nguyên nhân nằm trong broker log:
+Đối chiếu với §3.2: overhead của riêng router là 0.52 CPU-s/triệu, tức **11%**
+ngân sách CPU end-to-end. 89% còn lại là librdkafka, compression, syscall và
+tương tác với broker.
+
+Trace CPU dao động hình răng cưa (149 → 42 → 158 → 147 → …). Đó là hệ quả trực
+tiếp của `max_concurrent_writes = 1`: sink luân phiên giữa gom batch và ghi, và
+trong lúc ghi thì không gom. Xem §5.
+
+**Run trước đó cho thấy vì sao `session_timeout_ms` quan trọng.** Cùng topology,
+backlog 15M, `session_timeout_ms = 10000` (default cũ):
+
+```text
+Overall:        15,002,257 messages in 108.285 s = 138,544 msg/s
+Steady interval: median 343,473 msg/s
+Stall:          một khoảng 25 giây (t = 16 s → 41 s)
+Rebalance:      4 lần
+```
+
+Steady-state gần như giống hệt run chuẩn (343k so với 348k), nhưng **trung bình
+tụt 45%** chỉ vì các lần rebalance. Broker log ghi rõ nguyên nhân:
 
 ```text
 Preparing to rebalance group rustper-drain-v3 ... (reason: Adding new member ...)
 ```
 
-Consumer bị fence rồi rejoin **4 lần** trong một lần chạy. `session_timeout_ms`
-mặc định của rustper khi đó là `10000`, trong khi default của Kafka là `45000`:
-chỉ cần một heartbeat trễ vì connection bão hoà là broker đá consumer ra, và mỗi
-rebalance tốn vài giây ngừng tiêu thụ. Default đã được sửa thành `45000`, và
-`max_poll_interval_ms` giờ cấu hình được.
-
-**Bản sửa đó chưa được kiểm chứng end-to-end**: Docker daemon chết trước khi chạy
-lại được. Đây là gap đã biết — xem §7.
-
-Đo CPU của router trong Run B không dùng được: cửa sổ lấy mẫu rơi trúng stall nên
-median chỉ 2.0% (max 165.3%). Con số CPU end-to-end đáng tin duy nhất hiện có là
-số cũ ở §3.5.
+Default cũ là `10000` trong khi Kafka dùng `45000`: chỉ cần một heartbeat trễ vì
+connection bão hoà là broker fence consumer, và mỗi rebalance tốn vài giây ngừng
+tiêu thụ. Bài học rộng hơn: **steady-state throughput không nói lên gì về
+throughput thực nếu không kiểm tra broker log xem có rebalance hay không.**
 
 ### 3.5 Số cũ 2026-08-26 — vì sao thấp hơn 2×
 
@@ -222,8 +238,11 @@ Router RSS:         155.1 MiB warm idle, 168.3 MiB peak
 
 Phép đo đó **producer-bound**: router báo ~133k trong khi producer chỉ ghi 130.8k,
 tức là router chỉ đang theo kịp producer. Nó chứng minh một cận dưới, không phải
-capacity. §3.4 tách hai pha ra và cho 282,761 msg/s — **gấp 2.1 lần** — trên cùng
-máy, cùng topology.
+capacity. §3.4 tách hai pha ra và cho 255,704 msg/s average / 348,502 steady —
+**gấp 1.9 – 2.6 lần** trên cùng máy, cùng topology.
+
+Chi phí CPU cũng giảm: 6.68 CPU-s/triệu message so với 4.69 CPU-s/triệu ở §3.4,
+tức **thấp hơn 30%** trong khi throughput cao gần gấp đôi.
 
 Ba lỗi phương pháp còn lại của số cũ: n = 1; producer, broker và router tranh CPU
 trên cùng một máy 10 core; và không có số latency ở bất kỳ percentile nào.
@@ -231,9 +250,9 @@ trên cùng một máy 10 core; và không có số latency ở bất kỳ perce
 ### 3.6 Ba kết luận từ số liệu trên
 
 1. **Router không phải bottleneck, và không gần bottleneck.** In-process 1.03M
-   msg/s ở 0.54 core; end-to-end 283k msg/s. Overhead của chính router là
-   0.52 CPU-s/triệu message so với 6.7 CPU-s/triệu đo end-to-end — tức là **~8%**.
-   92% còn lại là librdkafka, syscall và broker.
+   msg/s ở 0.54 core; end-to-end 348k msg/s steady ở 1.25 core. Overhead của
+   chính router là 0.52 CPU-s/triệu so với 4.69 CPU-s/triệu đo end-to-end — tức
+   là **11%**. 89% còn lại là librdkafka, compression, syscall và broker.
 2. **Arena thắng 2.1× khi cô lập nhưng không đổi được số pipeline.** Normalization
    tốn ~55 ns/message, pipeline tốn ~900 ns/message. Chi phí nằm ở channel, task
    scheduling và acknowledgement, không nằm ở allocation. Đổi allocator sang
@@ -415,23 +434,22 @@ làm deduplication key nếu duplicate không được chấp nhận.
 
 Ưu tiên theo dữ liệu ở §3, không theo trực giác:
 
-1. **Xác nhận bản sửa `session_timeout_ms`.** Default đã đổi từ 10000 sang 45000
-   nhưng chưa chạy lại được end-to-end (§3.4). Chạy lại Run B và kiểm tra broker
-   log không còn dòng `Preparing to rebalance`. Đây là việc cần làm đầu tiên.
-2. **Lấy một phép đo CPU end-to-end hợp lệ.** Cửa sổ lấy mẫu ở Run B rơi trúng
-   stall. Cần backlog đủ lớn để có ≥60 s steady state, hoặc lấy mẫu sau khi đã
-   xác nhận không có rebalance.
-3. **Prometheus metrics**: batch size, queue depth, bytes in-flight, retry count,
-   rebalance count, consumer lag, latency p95/p99. Không có nhóm này thì stall 25
-   giây ở Run B đã không thể phát hiện từ trong process — phải đi đọc broker log.
-4. **Đo `max_concurrent_writes` ở 1 so với 2–4.** Cả hai run đều chạy ở `1`, tức
-   là sink ghi tuần tự. §5 giải thích vì sao đây là trần thông lượng có thật.
-5. **Profile delivery path, không phải normalization.** §3.6 cho thấy router chỉ
-   chiếm ~8% CPU end-to-end; 92% nằm ở librdkafka và syscall. Dùng `samply`,
+1. **Đo `max_concurrent_writes` ở 1 so với 2–4.** Mọi run đều chạy ở `1`, và
+   trace CPU răng cưa ở §3.4 (149% → 42% → 158% → …) là bằng chứng trực tiếp
+   rằng sink đang luân phiên gom và ghi thay vì làm cả hai. Đây là candidate rõ
+   ràng nhất còn lại.
+2. **Prometheus metrics**: batch size, queue depth, bytes in-flight, retry count,
+   **rebalance count**, consumer lag, latency p95/p99. Stall 25 giây ở §3.4
+   không thể phát hiện từ trong process — phải đi đọc broker log. Đó là lỗ hổng
+   observability nghiêm trọng nhất hiện nay.
+3. **Latency.** Chưa có số ở bất kỳ percentile nào, trong khi §5 lại hướng dẫn
+   tune theo p95/p99.
+4. **Profile delivery path, không phải normalization.** §3.6 cho thấy router chỉ
+   chiếm 11% CPU end-to-end; 89% nằm ở librdkafka và syscall. Dùng `samply`,
    Instruments hoặc flamegraph trên phần đó.
-6. **Benchmark ClickHouse riêng** với 10–100 triệu rows.
-7. **Disk buffer/WAL** nếu cần durability khi process hoặc host crash.
-8. **Multiple source workers** — chỉ khi profiler chứng minh một source task đã
+5. **Benchmark ClickHouse riêng** với 10–100 triệu rows.
+6. **Disk buffer/WAL** nếu cần durability khi process hoặc host crash.
+7. **Multiple source workers** — chỉ khi profiler chứng minh một source task đã
    chạm trần một core. Dữ liệu hiện tại **không** ủng hộ việc này.
 
 ## 8. Những gì tài liệu này không trả lời
@@ -439,10 +457,11 @@ làm deduplication key nếu duplicate không được chấp nhận.
 Ghi rõ để không ai đọc nhầm:
 
 - Không có số latency, ở bất kỳ percentile nào.
-- Không có phép đo CPU end-to-end hợp lệ sau khi sửa `session_timeout_ms`.
-- Không có số nào đo trên Linux, trên bare metal, hay với broker ở máy khác. Broker
-  chạy trong Linux VM của Docker Desktop/OrbStack với network và disk ảo hoá.
+- Không có số nào đo trên Linux, trên bare metal, hay với broker ở máy khác.
+  Broker chạy trong Linux VM của OrbStack với network và disk ảo hoá, và chia
+  CPU với router trên cùng một máy 10 core.
 - Số end-to-end là n = 1 mỗi cấu hình, không phải median của 5 lần chạy như §3.7
   yêu cầu.
+- Mọi run đều ở `max_concurrent_writes = 1`; chưa đo cấu hình pipeline.
 - Không có so sánh với Vector, Benthos, Flink hay bất kỳ công cụ nào khác.
 - Không có phép đo nào ở nhiều replica hoặc trong lúc rebalance có chủ đích.
