@@ -1,24 +1,24 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
 use rdkafka::{
     ClientConfig, Message,
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::BorrowedMessage,
     topic_partition_list::{Offset, TopicPartitionList},
 };
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
     config::KafkaSourceConfig,
-    event::{Event, SourceMetadata},
+    event::{BatchBuffer, Event, EventBatch, SourceMetadata},
     source::Source,
     topology::Fanout,
 };
@@ -31,15 +31,26 @@ pub struct KafkaSource {
 
 impl KafkaSource {
     pub fn new(id: &str, config: &KafkaSourceConfig) -> Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
+        let mut client = ClientConfig::new();
+        client
             .set("bootstrap.servers", &config.brokers)
             .set("group.id", &config.group_id)
             .set("session.timeout.ms", config.session_timeout_ms.to_string())
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
-            .create()
-            .context("cannot create Kafka source")?;
+            .set(
+                "queued.max.messages.kbytes",
+                config.queued_max_messages_kbytes.to_string(),
+            )
+            .set(
+                "queued.min.messages",
+                config.queued_min_messages.to_string(),
+            );
+        for (key, value) in &config.client_config {
+            client.set(key, value);
+        }
+        let consumer: StreamConsumer = client.create().context("cannot create Kafka source")?;
         let topics: Vec<&str> = config.topics.iter().map(String::as_str).collect();
         consumer
             .subscribe(&topics)
@@ -59,25 +70,55 @@ struct BatchCompletion {
     bytes: usize,
 }
 
+/// Interns topic names so each event holds a shared `Arc<str>` instead of its
+/// own `String`.
+///
+/// A batch almost always comes from one topic, so the single-entry `last` slot
+/// answers nearly every lookup with a pointer comparison and skips hashing the
+/// topic name once per message.
+#[derive(Default)]
+struct TopicCache {
+    last: Option<Arc<str>>,
+    interned: HashMap<String, Arc<str>>,
+}
+
+impl TopicCache {
+    fn intern(&mut self, topic: &str) -> Arc<str> {
+        if let Some(last) = &self.last
+            && last.as_ref() == topic
+        {
+            return Arc::clone(last);
+        }
+        let interned = match self.interned.get(topic) {
+            Some(interned) => Arc::clone(interned),
+            None => {
+                let interned: Arc<str> = Arc::from(topic);
+                self.interned
+                    .insert(topic.to_owned(), Arc::clone(&interned));
+                interned
+            }
+        };
+        self.last = Some(Arc::clone(&interned));
+        interned
+    }
+}
+
 fn to_event(
     component_id: &Arc<str>,
-    topics: &mut HashMap<String, Arc<str>>,
+    topics: &mut TopicCache,
+    buffer: &mut BatchBuffer,
     message: &BorrowedMessage<'_>,
 ) -> Event {
-    let topic = topics
-        .entry(message.topic().to_owned())
-        .or_insert_with(|| Arc::from(message.topic()))
-        .clone();
     Event {
-        key: message.key().map(Bytes::copy_from_slice),
+        key: message.key().map(|key| buffer.copy(key)),
         payload: message
             .payload()
-            .map(Bytes::copy_from_slice)
+            .map(|p| buffer.copy(p))
             .unwrap_or_default(),
         timestamp_ms: message.timestamp().to_millis(),
         source: SourceMetadata {
             component_id: Arc::clone(component_id),
-            topic,
+            topic: topics.intern(message.topic()),
             partition: message.partition(),
             offset: message.offset(),
         },
@@ -85,18 +126,26 @@ fn to_event(
 }
 
 fn offsets_for(events: &[Event]) -> Result<TopicPartitionList> {
-    let mut next_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
+    // A batch spans a handful of (topic, partition) pairs at most, so a linear
+    // scan beats hashing the topic name once per event.
+    let mut next_offsets: Vec<(&str, i32, i64)> = Vec::new();
     for event in events {
-        next_offsets
-            .entry((Arc::clone(&event.source.topic), event.source.partition))
-            .and_modify(|offset| *offset = (*offset).max(event.source.offset + 1))
-            .or_insert(event.source.offset + 1);
+        let topic = event.source.topic.as_ref();
+        let partition = event.source.partition;
+        let next = event.source.offset + 1;
+        match next_offsets
+            .iter_mut()
+            .find(|(seen, seen_partition, _)| *seen_partition == partition && *seen == topic)
+        {
+            Some((_, _, offset)) => *offset = (*offset).max(next),
+            None => next_offsets.push((topic, partition, next)),
+        }
     }
     let mut offsets = TopicPartitionList::new();
-    for ((topic, partition), offset) in next_offsets {
+    for (topic, partition, offset) in next_offsets {
         offsets
-            .add_partition_offset(&topic, partition, Offset::Offset(offset))
-            .map_err(|error| anyhow!(error))?;
+            .add_partition_offset(topic, partition, Offset::Offset(offset))
+            .context("cannot record next offsets for Kafka batch")?;
     }
     Ok(offsets)
 }
@@ -112,7 +161,6 @@ fn commit_contiguous(
     while let Some(completion) = completed.remove(next_sequence) {
         consumer
             .commit(&completion.offsets, CommitMode::Async)
-            .map_err(|error| anyhow!(error))
             .context("cannot commit Kafka batch")?;
         committed_events += completion.events;
         *next_sequence += 1;
@@ -120,71 +168,229 @@ fn commit_contiguous(
     Ok(committed_events)
 }
 
+/// Reports throughput over the interval since the previous report, not as a
+/// running average since the first message. A cumulative average keeps sinking
+/// toward the mean and hides both ramp-up and stalls.
+struct ThroughputReporter {
+    component: Arc<str>,
+    every: u64,
+    next_report: u64,
+    window_started: Instant,
+    window_events: u64,
+    total_started: Instant,
+}
+
+impl ThroughputReporter {
+    fn new(component: Arc<str>, every: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            component,
+            every: every.max(1),
+            next_report: every.max(1),
+            window_started: now,
+            window_events: 0,
+            total_started: now,
+        }
+    }
+
+    fn record(&mut self, events: u64, total: u64) {
+        self.window_events += events;
+        if total < self.next_report {
+            return;
+        }
+        let window_seconds = self.window_started.elapsed().as_secs_f64();
+        let total_seconds = self.total_started.elapsed().as_secs_f64();
+        info!(
+            component = %self.component,
+            processed = total,
+            interval_messages_per_second = self.window_events as f64 / window_seconds.max(f64::MIN_POSITIVE),
+            average_messages_per_second = total as f64 / total_seconds.max(f64::MIN_POSITIVE),
+            elapsed_seconds = total_seconds,
+            "source throughput",
+        );
+        self.next_report = (total / self.every + 1) * self.every;
+        self.window_started = Instant::now();
+        self.window_events = 0;
+    }
+}
+
+const REPORT_EVERY: u64 = 100_000;
+
 #[async_trait]
 impl Source for KafkaSource {
     async fn run(self: Box<Self>, output: Fanout, shutdown: CancellationToken) -> Result<()> {
         info!(component = %self.id, topics = ?self.config.topics, "source started");
+        let batch_size = self.config.batch_size;
+        let linger = Duration::from_millis(self.config.batch_linger_ms);
+
         let mut processed = 0_u64;
-        let mut measurement_started: Option<std::time::Instant> = None;
-        let mut next_report = 100_000_u64;
-        let mut topic_cache = HashMap::new();
+        let mut reporter = ThroughputReporter::new(Arc::clone(&self.id), REPORT_EVERY);
+        let mut topics = TopicCache::default();
+        let mut buffer = BatchBuffer::default();
         let mut in_flight: tokio::task::JoinSet<Result<BatchCompletion>> =
             tokio::task::JoinSet::new();
         let mut sequence = 0_u64;
         let mut next_commit_sequence = 0_u64;
-        let mut completed = BTreeMap::new();
         let mut in_flight_bytes = 0_usize;
+        let mut completed = BTreeMap::new();
+
+        let mut pending: Vec<Event> = Vec::with_capacity(batch_size);
+        // One timer for the whole batch. Arming a `timeout` per `recv` would
+        // register and cancel a timer entry for every single message.
+        let deadline = sleep_until(TokioInstant::now());
+        tokio::pin!(deadline);
 
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    in_flight.abort_all();
-                    return Ok(());
-                },
-                joined = in_flight.join_next(), if !in_flight.is_empty() => {
-                    let completion = joined.expect("in-flight set is not empty")
-                        .context("fan-out task panicked")??;
-                    in_flight_bytes = in_flight_bytes.saturating_sub(completion.bytes);
-                    processed += commit_contiguous(
-                        &self.consumer, &mut completed, &mut next_commit_sequence, completion,
-                    )?;
-                    if processed >= next_report {
-                        let seconds = measurement_started.unwrap().elapsed().as_secs_f64();
-                        info!(component = %self.id, processed, seconds,
-                            messages_per_second = processed as f64 / seconds, "source throughput");
-                        next_report = (processed / 100_000 + 1) * 100_000;
-                    }
-                },
-                result = self.consumer.recv(), if in_flight.len() < self.config.max_in_flight_batches
-                    && in_flight_bytes < self.config.max_in_flight_bytes => {
-                    measurement_started.get_or_insert_with(std::time::Instant::now);
-                    let first = result.context("Kafka consume failed")?;
-                    let mut events = Vec::with_capacity(self.config.batch_size);
-                    events.push(to_event(&self.id, &mut topic_cache, &first));
-                    let deadline = tokio::time::Instant::now()
-                        + Duration::from_millis(self.config.batch_linger_ms);
-                    while events.len() < self.config.batch_size {
-                        match tokio::time::timeout_at(deadline, self.consumer.recv()).await {
-                            Ok(Ok(message)) => events.push(to_event(&self.id, &mut topic_cache, &message)),
-                            Ok(Err(error)) => return Err(error).context("Kafka consume failed"),
-                            Err(_) => break,
-                        }
-                    }
+            let admits_batch = in_flight.len() < self.config.max_in_flight_batches
+                && in_flight_bytes < self.config.max_in_flight_bytes;
+
+            // A batch is dispatched from two places, so the closure keeps the
+            // bookkeeping in one spot.
+            macro_rules! dispatch {
+                () => {{
+                    let events = std::mem::replace(&mut pending, Vec::with_capacity(batch_size));
                     let offsets = offsets_for(&events)?;
-                    let event_count = events.len() as u64;
-                    let event_bytes = events.iter().map(Event::estimated_size).sum::<usize>();
+                    let batch = EventBatch::new(events);
+                    let event_count = batch.len() as u64;
+                    let event_bytes = batch.bytes();
                     in_flight_bytes = in_flight_bytes.saturating_add(event_bytes);
                     let batch_sequence = sequence;
                     sequence += 1;
                     let fanout = output.clone();
                     in_flight.spawn(async move {
-                        fanout.send(events).await?;
+                        fanout.send(batch).await?;
                         Ok::<_, anyhow::Error>(BatchCompletion {
-                            sequence: batch_sequence, offsets, events: event_count, bytes: event_bytes,
+                            sequence: batch_sequence,
+                            offsets,
+                            events: event_count,
+                            bytes: event_bytes,
                         })
                     });
-                }
+                }};
+            }
+
+            tokio::select! {
+                biased;
+
+                _ = shutdown.cancelled() => {
+                    // In-flight batches are dropped without committing their
+                    // offsets, so Kafka replays them on restart. This preserves
+                    // at-least-once semantics: no data is lost, but already
+                    // delivered batches may be redelivered.
+                    in_flight.abort_all();
+                    return Ok(());
+                },
+
+                // Servicing completions stays possible while a batch is being
+                // assembled, so commits and the byte budget are never held
+                // hostage by the linger window.
+                joined = in_flight.join_next(), if !in_flight.is_empty() => {
+                    let completion = joined.expect("in-flight set is not empty")
+                        .context("fan-out task panicked")??;
+                    in_flight_bytes = in_flight_bytes.saturating_sub(completion.bytes);
+                    let committed = commit_contiguous(
+                        &self.consumer, &mut completed, &mut next_commit_sequence, completion,
+                    )?;
+                    processed += committed;
+                    reporter.record(committed, processed);
+                },
+
+                // Gated on `admits_batch` as well, so an elapsed timer cannot
+                // spin while the in-flight window is full.
+                _ = &mut deadline, if !pending.is_empty() && admits_batch => dispatch!(),
+
+                result = self.consumer.recv(), if admits_batch && pending.len() < batch_size => {
+                    let message = result.context("Kafka consume failed")?;
+                    if pending.is_empty() {
+                        deadline.as_mut().reset(TokioInstant::now() + linger);
+                    }
+                    pending.push(to_event(&self.id, &mut topics, &mut buffer, &message));
+                    if pending.len() >= batch_size {
+                        dispatch!();
+                    }
+                },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rdkafka::topic_partition_list::Offset;
+
+    use super::{TopicCache, offsets_for};
+    use crate::event::{Event, SourceMetadata};
+
+    fn event(topic: &str, partition: i32, offset: i64) -> Event {
+        Event {
+            key: None,
+            payload: "x".into(),
+            timestamp_ms: None,
+            source: SourceMetadata {
+                component_id: Arc::from("source"),
+                topic: Arc::from(topic),
+                partition,
+                offset,
+            },
+        }
+    }
+
+    #[test]
+    fn next_offset_is_highest_consumed_offset_plus_one() {
+        let events = vec![
+            event("a", 0, 10),
+            event("a", 0, 12), // same partition: the highest offset wins
+            event("a", 1, 5),
+            event("b", 0, 3),
+        ];
+        let offsets = offsets_for(&events).unwrap();
+        assert_eq!(
+            offsets.find_partition("a", 0).unwrap().offset(),
+            Offset::Offset(13)
+        );
+        assert_eq!(
+            offsets.find_partition("a", 1).unwrap().offset(),
+            Offset::Offset(6)
+        );
+        assert_eq!(
+            offsets.find_partition("b", 0).unwrap().offset(),
+            Offset::Offset(4)
+        );
+    }
+
+    #[test]
+    fn out_of_order_offsets_never_move_a_commit_backwards() {
+        let events = vec![event("a", 0, 12), event("a", 0, 4), event("a", 0, 9)];
+        assert_eq!(
+            offsets_for(&events)
+                .unwrap()
+                .find_partition("a", 0)
+                .unwrap()
+                .offset(),
+            Offset::Offset(13)
+        );
+    }
+
+    #[test]
+    fn empty_events_yield_no_offsets() {
+        let offsets = offsets_for(&[]).unwrap();
+        assert!(offsets.elements().is_empty());
+    }
+
+    #[test]
+    fn topic_cache_returns_one_shared_arc_per_topic() {
+        let mut cache = TopicCache::default();
+        let first = cache.intern("a");
+        let second = cache.intern("a");
+        let other = cache.intern("b");
+        let first_again = cache.intern("a");
+        assert!(Arc::ptr_eq(&first, &second), "repeat lookup must be shared");
+        assert!(
+            Arc::ptr_eq(&first, &first_again),
+            "map lookup must be shared"
+        );
+        assert_eq!(other.as_ref(), "b");
     }
 }
