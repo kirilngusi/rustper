@@ -19,6 +19,11 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The hot path allocates per batch (arena chunks, librdkafka queues); the system
+# allocator on glibc/macOS is the weakest link there and retains more pages.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
@@ -26,3 +31,11 @@ path = "src/bin/benchmark.rs"
 [[bin]]
 name = "kafka-load"
 path = "src/bin/kafka_load.rs"
+
+[profile.release]
+# The measured numbers in docs/PERFORMANCE.md predate these settings.
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

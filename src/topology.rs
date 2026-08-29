@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -8,21 +11,23 @@ use futures::future::try_join_all;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
-use crate::{config::Config, event::Event, sink, source};
-
-pub type EventBatch = Arc<Vec<Event>>;
+use crate::{config::Config, event::EventBatch, sink, source};
 
 pub struct SinkEnvelope {
-    pub events: EventBatch,
+    batch: Arc<EventBatch>,
     ack: BranchAck,
 }
 
 impl SinkEnvelope {
-    pub fn delivered(mut self) {
+    pub fn batch(&self) -> &Arc<EventBatch> {
+        &self.batch
+    }
+    pub fn delivered(self) {
         self.ack.complete(true);
     }
-    pub fn failed(mut self) {
+    pub fn failed(self) {
         self.ack.complete(false);
     }
 }
@@ -35,22 +40,21 @@ struct AckState {
 
 struct BranchAck {
     state: Arc<Mutex<AckState>>,
-    completed: bool,
+    completed: AtomicBool,
 }
 
 impl BranchAck {
-    fn complete(&mut self, delivered: bool) {
-        if self.completed {
+    fn complete(&self, delivered: bool) {
+        if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.completed = true;
         let mut state = self.state.lock().expect("ack mutex poisoned");
         state.delivered &= delivered;
         state.remaining -= 1;
-        if state.remaining == 0 {
-            if let Some(notify) = state.notify.take() {
-                let _ = notify.send(state.delivered);
-            }
+        if state.remaining == 0
+            && let Some(notify) = state.notify.take()
+        {
+            let _ = notify.send(state.delivered);
         }
     }
 }
@@ -67,7 +71,13 @@ pub struct Fanout {
 }
 
 impl Fanout {
-    pub async fn send(&self, events: Vec<Event>) -> Result<()> {
+    pub fn new(destinations: Vec<mpsc::Sender<SinkEnvelope>>) -> Self {
+        Self {
+            destinations: Arc::new(destinations),
+        }
+    }
+
+    pub async fn send(&self, batch: EventBatch) -> Result<()> {
         if self.destinations.is_empty() {
             return Ok(());
         }
@@ -77,13 +87,13 @@ impl Fanout {
             delivered: true,
             notify: Some(notify),
         }));
-        let events = Arc::new(events);
+        let batch = Arc::new(batch);
         let sends = self.destinations.iter().map(|destination| {
             let envelope = SinkEnvelope {
-                events: Arc::clone(&events),
+                batch: Arc::clone(&batch),
                 ack: BranchAck {
                     state: Arc::clone(&state),
-                    completed: false,
+                    completed: AtomicBool::new(false),
                 },
             };
             async move {
@@ -102,6 +112,27 @@ impl Fanout {
     }
 }
 
+/// Waits for every task in `tasks`, returning the first failure.
+async fn join_all(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    while let Some(joined) = tasks.join_next().await {
+        joined??;
+    }
+    Ok(())
+}
+
+/// Resolves on the first task failure, and never resolves otherwise.
+///
+/// A sink that exits cleanly is not itself a reason to tear the topology down;
+/// the sources notice through their closed channels.
+async fn first_failure(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    loop {
+        match tasks.join_next().await {
+            Some(joined) => joined??,
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
 pub async fn run(config: Config) -> Result<()> {
     config.validate()?;
     let shutdown = CancellationToken::new();
@@ -113,8 +144,9 @@ pub async fn run(config: Config) -> Result<()> {
         let (tx, rx) = mpsc::channel(capacity);
         sink_inputs.insert(id.clone(), tx);
         let component = sink::build(id, sink_config)?;
+        let settings = sink_config.runtime_settings();
         let token = shutdown.child_token();
-        sink_tasks.spawn(async move { sink::run(component, rx, token).await });
+        sink_tasks.spawn(async move { sink::run(component, settings, rx, token).await });
     }
 
     let mut source_tasks = JoinSet::new();
@@ -126,45 +158,38 @@ pub async fn run(config: Config) -> Result<()> {
             .map(|(sink_id, _)| sink_inputs[sink_id].clone())
             .collect();
         let component = source::build(id, source_config)?;
-        let fanout = Fanout {
-            destinations: Arc::new(destinations),
-        };
+        let fanout = Fanout::new(destinations);
         let token = shutdown.child_token();
         source_tasks.spawn(async move { component.run(fanout, token).await });
     }
+    drop(sink_inputs);
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        result = source_tasks.join_next() => {
-            match result {
-                Some(Ok(Ok(()))) | None => {},
-                Some(Ok(Err(error))) => return Err(error),
-                Some(Err(error)) => return Err(error.into()),
-            }
-        }
-        result = sink_tasks.join_next() => {
-            match result {
-                Some(Ok(Ok(()))) | None => {},
-                Some(Ok(Err(error))) => return Err(error),
-                Some(Err(error)) => return Err(error.into()),
-            }
-        }
-    }
+    let outcome = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutdown signal received");
+            Ok(())
+        },
+        result = join_all(&mut source_tasks) => result,
+        result = first_failure(&mut sink_tasks) => result,
+    };
+
     shutdown.cancel();
-    Ok(())
+    source_tasks.shutdown().await;
+    // Sinks are given the chance to finish their in-flight writes; their
+    // acknowledgements are what keep the at-least-once contract honest.
+    let drained = join_all(&mut sink_tasks).await;
+    outcome.and(drained)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tokio::sync::mpsc;
 
     use super::Fanout;
-    use crate::event::{Event, SourceMetadata};
+    use crate::event::{Event, EventBatch, SourceMetadata};
 
-    fn event() -> Event {
-        Event {
+    fn batch() -> EventBatch {
+        EventBatch::new(vec![Event {
             key: None,
             payload: "hello".into(),
             timestamp_ms: None,
@@ -174,17 +199,15 @@ mod tests {
                 partition: 0,
                 offset: 0,
             },
-        }
+        }])
     }
 
     #[tokio::test]
     async fn waits_for_every_fanout_branch() {
         let (first_tx, mut first_rx) = mpsc::channel(1);
         let (second_tx, mut second_rx) = mpsc::channel(1);
-        let fanout = Fanout {
-            destinations: Arc::new(vec![first_tx, second_tx]),
-        };
-        let send = tokio::spawn(async move { fanout.send(vec![event()]).await });
+        let fanout = Fanout::new(vec![first_tx, second_tx]);
+        let send = tokio::spawn(async move { fanout.send(batch()).await });
 
         first_rx.recv().await.unwrap().delivered();
         assert!(
@@ -199,13 +222,20 @@ mod tests {
     async fn one_failed_branch_rejects_the_batch() {
         let (first_tx, mut first_rx) = mpsc::channel(1);
         let (second_tx, mut second_rx) = mpsc::channel(1);
-        let fanout = Fanout {
-            destinations: Arc::new(vec![first_tx, second_tx]),
-        };
-        let send = tokio::spawn(async move { fanout.send(vec![event()]).await });
+        let fanout = Fanout::new(vec![first_tx, second_tx]);
+        let send = tokio::spawn(async move { fanout.send(batch()).await });
 
         first_rx.recv().await.unwrap().delivered();
         second_rx.recv().await.unwrap().failed();
+        assert!(send.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_envelope_fails_the_batch() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let send = tokio::spawn(async move { fanout.send(batch()).await });
+        drop(rx.recv().await.unwrap());
         assert!(send.await.unwrap().is_err());
     }
 }
