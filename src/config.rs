@@ -165,6 +165,21 @@ pub struct ClickhouseSinkConfig {
     pub batch_max_bytes: usize,
     #[serde(default = "default_clickhouse_sink_linger_ms")]
     pub batch_linger_ms: u64,
+    /// How rows are shaped for ClickHouse.
+    #[serde(default)]
+    pub schema: ClickhouseSchema,
+    /// Names for the Kafka coordinates, which a JSON payload cannot carry.
+    /// Only meaningful with `schema = "json"`.
+    #[serde(default)]
+    pub metadata_columns: MetadataColumnsConfig,
+    /// ClickHouse `input_format_allow_errors_num`. Rows the router cannot
+    /// reject cheaply — a value that does not fit its column — are skipped by
+    /// ClickHouse instead of failing the whole insert.
+    #[serde(default)]
+    pub allow_errors_num: u64,
+    /// ClickHouse `input_format_allow_errors_ratio`, between 0.0 and 1.0.
+    #[serde(default)]
+    pub allow_errors_ratio: f64,
     /// Batches this sink may have in flight at once.
     ///
     /// Values above 1 let the next batch coalesce while the current write is on
@@ -180,6 +195,36 @@ pub struct ClickhouseSinkConfig {
     pub retry_initial_backoff_ms: u64,
     #[serde(default = "default_retry_max_backoff_ms")]
     pub retry_max_backoff_ms: u64,
+}
+
+/// How the ClickHouse sink shapes rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickhouseSchema {
+    /// The seven fixed columns. The historical behaviour, and the default so
+    /// existing configs keep working.
+    #[default]
+    Event,
+    /// The payload is a JSON object whose keys are column names. ClickHouse
+    /// performs every type conversion.
+    Json,
+}
+
+/// Column names for injected Kafka coordinates. Unset fields are not injected.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataColumnsConfig {
+    pub topic: Option<String>,
+    pub partition: Option<String>,
+    pub offset: Option<String>,
+    pub timestamp: Option<String>,
+    pub key: Option<String>,
+}
+
+impl MetadataColumnsConfig {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Delivery behaviour resolved into the types the sink runtime uses.
@@ -349,6 +394,17 @@ impl Config {
             let (max_events, max_bytes) = sink.batch_limits();
             if max_events == 0 || max_bytes == 0 {
                 bail!("sink {id:?} batch limits must be > 0");
+            }
+            if let SinkConfig::Clickhouse(c) = sink {
+                if c.schema == ClickhouseSchema::Event && !c.metadata_columns.is_empty() {
+                    bail!(
+                        "sink {id:?} sets metadata_columns, which only applies to \
+                         schema = \"json\"; in event mode the column names are fixed"
+                    );
+                }
+                if !(0.0..=1.0).contains(&c.allow_errors_ratio) {
+                    bail!("sink {id:?} allow_errors_ratio must be between 0.0 and 1.0");
+                }
             }
             let delivery = sink.runtime_settings();
             if delivery.retry_initial_backoff > delivery.retry_max_backoff {

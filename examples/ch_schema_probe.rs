@@ -6,8 +6,12 @@
 //! prints whatever ClickHouse says.
 //!
 //! ```text
-//! cargo run --release --example ch_schema_probe -- my_table
+//! cargo run --release --example ch_schema_probe -- my_table [event|json]
 //! ```
+//!
+//! `json` mode is worth probing precisely because it has no startup
+//! validation: unlike `event` mode it does not run `DESCRIBE TABLE`, so a
+//! mismatched table is only discovered when a real insert is attempted.
 //!
 //! Connection details come from `CLICKHOUSE_URL`, `CLICKHOUSE_DB`,
 //! `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`, defaulting to the
@@ -25,7 +29,7 @@
 use std::{env, sync::Arc};
 
 use rustper::{
-    config::{ClickhouseSinkConfig, SinkConfig},
+    config::{ClickhouseSchema, ClickhouseSinkConfig, MetadataColumnsConfig, SinkConfig},
     event::{Event, EventBatch, SourceMetadata},
     sink::build,
 };
@@ -34,7 +38,7 @@ fn env_or(key: &str, fallback: &str) -> String {
     env::var(key).unwrap_or_else(|_| fallback.to_owned())
 }
 
-fn config(table: &str) -> SinkConfig {
+fn config(table: &str, schema: ClickhouseSchema) -> SinkConfig {
     SinkConfig::Clickhouse(ClickhouseSinkConfig {
         inputs: vec!["probe".into()],
         endpoint: env_or("CLICKHOUSE_URL", "http://localhost:8123"),
@@ -50,6 +54,10 @@ fn config(table: &str) -> SinkConfig {
         retry_max_attempts: 1,
         retry_initial_backoff_ms: 1,
         retry_max_backoff_ms: 1,
+        schema,
+        metadata_columns: MetadataColumnsConfig::default(),
+        allow_errors_num: 0,
+        allow_errors_ratio: 0.0,
     })
 }
 
@@ -70,10 +78,18 @@ fn probe_batch() -> Arc<EventBatch> {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let Some(table) = env::args().nth(1) else {
-        eprintln!("usage: ch_schema_probe <table>");
+        eprintln!("usage: ch_schema_probe <table> [event|json]");
         return std::process::ExitCode::FAILURE;
     };
-    let sink = match build("probe", &config(&table)) {
+    let schema = match env::args().nth(2).as_deref() {
+        None | Some("event") => ClickhouseSchema::Event,
+        Some("json") => ClickhouseSchema::Json,
+        Some(other) => {
+            eprintln!("unknown schema {other:?}; expected \"event\" or \"json\"");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let sink = match build("probe", &config(&table, schema)) {
         Ok(sink) => sink,
         Err(error) => {
             eprintln!("cannot build the ClickHouse sink: {error:#}");

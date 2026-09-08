@@ -1,0 +1,48 @@
+# Inserting into a table you already own.
+#
+# The payload is a JSON object whose keys are column names; ClickHouse performs
+# every type conversion. Create the table first, for example:
+#
+#   CREATE TABLE orders (
+#     order_id   UInt64,
+#     user_id    UInt64,
+#     amount     Decimal(18, 4),
+#     currency   LowCardinality(String),
+#     tags       Array(String),
+#     created_at DateTime64(3),
+#     _topic     LowCardinality(String),
+#     _partition Int32,
+#     _offset    Int64
+#   ) ENGINE = MergeTree ORDER BY order_id;
+
+[metrics]
+log_interval_seconds = 10
+listen = "127.0.0.1:9100"
+
+[sources.kafka_in]
+type = "kafka"
+brokers = "localhost:9092"
+group_id = "rustper-orders-v1"
+topics = ["orders-in"]
+batch_size = 1000
+batch_linger_ms = 5
+
+[sinks.orders]
+type = "clickhouse"
+inputs = ["kafka_in"]
+endpoint = "http://localhost:8123"
+database = "default"
+table = "orders"
+user = "default"
+password = "rustper"
+batch_max_events = 10000
+batch_linger_ms = 100
+schema = "json"
+# Rows ClickHouse itself cannot parse are skipped rather than failing the batch.
+allow_errors_ratio = 0.01
+
+# Kafka coordinates, which a JSON payload cannot carry itself.
+[sinks.orders.metadata_columns]
+topic = "_topic"
+partition = "_partition"
+offset = "_offset"

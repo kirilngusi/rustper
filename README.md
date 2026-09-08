@@ -80,11 +80,61 @@ enable_idempotence = true     # librdkafka caps in-flight requests at 5 when on
 queue_buffering_max_kbytes = 1048576
 ```
 
-## ClickHouse sink: schema contract
+## ClickHouse sink
 
-The sink writes a **fixed set of seven columns**. There is no column mapping and
-no way to project the payload into typed columns. Point it at an existing table
-only if that table satisfies the contract below.
+Two modes. `schema = "event"` is the default and unchanged; `schema = "json"`
+writes into a table you already own.
+
+### `schema = "json"`: your own table
+
+The payload is treated as a JSON object whose keys are column names, streamed
+with `FORMAT JSONEachRow`. **ClickHouse performs every type conversion**, so the
+router never needs to know that a column is `Decimal(18, 4)`, and every
+ClickHouse type works without the router supporting it explicitly.
+
+```toml
+[sinks.orders]
+type = "clickhouse"
+inputs = ["kafka_in"]
+endpoint = "http://localhost:8123"
+table = "orders"
+schema = "json"
+
+[sinks.orders.metadata_columns]   # optional; only declared keys are injected
+topic     = "_topic"
+partition = "_partition"
+offset    = "_offset"
+timestamp = "_event_ts"
+key       = "_key"
+```
+
+Given `{"order_id":1,"amount":"19.99","tags":["new"]}` on `orders-in`, a table
+of `order_id UInt64, amount Decimal(18,4), tags Array(String), _topic
+LowCardinality(String), _partition Int32, _offset Int64` receives exactly that,
+with the Kafka coordinates filled in.
+
+Rows the router can reject in constant time — an empty payload, or one that is
+not a JSON object — are dropped, counted in `rustper_sink_events_dropped_total`,
+and summarised in one warning per write rather than one per row. Anything
+subtler, such as a value that does not fit its column, is left to ClickHouse:
+set `allow_errors_num` or `allow_errors_ratio` and it skips those rows instead
+of failing the batch.
+
+> `json` mode does **not** validate the schema at startup. Unlike `event` mode
+> it issues no `DESCRIBE TABLE`, so a mismatched table is only discovered on the
+> first real insert. Check a table before deploying with
+> `cargo run --release --example ch_schema_probe -- my_table json`.
+
+**Reshaping data is ClickHouse's job, not the router's.** rustper has no
+transformation language on purpose. Land raw rows in a staging table and attach
+a materialized view; ClickHouse does that work in vectorized C++ over whole
+blocks, which no row-by-row router can match.
+
+### `schema = "event"`: the built-in schema
+
+The default mode writes a **fixed set of seven columns**. Point it at an
+existing table only if that table satisfies the contract below, or use
+`schema = "json"` instead.
 
 | Column | Required type |
 | --- | --- |
@@ -168,7 +218,7 @@ any percentile, and were never taken on Linux or bare metal. `docs/PERFORMANCE.m
 | --- | --- |
 | `cargo run --release --bin benchmark` | router overhead alone, no broker |
 | `cargo run --release --example normalize_ab` | arena copy vs. one alloc per field |
-| `cargo run --release --example ch_schema_probe -- <table>` | how a ClickHouse schema is accepted or rejected |
+| `cargo run --release --example ch_schema_probe -- <table> [event\|json]` | whether a ClickHouse table is accepted |
 | `cargo run --release --bin kafka-load` | load generator for end-to-end runs |
 
 ```bash
@@ -176,13 +226,40 @@ KAFKA_TOPIC=rustper-input MESSAGE_COUNT=100000 \
   cargo run --release --bin kafka-load
 ```
 
+## Metrics
+
+Two reporting paths, because not everyone runs Prometheus.
+
+```toml
+[metrics]
+log_interval_seconds = 10     # 0 disables; on by default
+listen = "0.0.0.0:9100"       # absent means no listener at all
+```
+
+The log reporter needs nothing but `RUST_LOG=info` and emits one structured line
+per component per interval:
+
+```text
+INFO source metrics component=kafka_in events_per_second=348502 events_total=15000000 in_flight_batches=8 rebalances=1
+INFO sink metrics component=orders events_per_second=348502 dropped_per_second=0 queue_depth=0 retries=0 write_errors=0
+```
+
+Rates are always the delta over the interval, never a running average since
+startup — an average is dragged down by ramp-up and hides stalls entirely.
+
+When `listen` is set, `/metrics` serves the Prometheus text format and every
+other path returns 404. `rustper_source_rebalances_total` is the one to watch:
+a rebalance stalls consumption for seconds and is otherwise invisible from
+inside the process. It counts the initial assignment too, so alert on its rate
+rather than its total.
+
 ## Limitations
 
-- **No metrics.** No Prometheus endpoint, no latency histogram, no rebalance
-  counter. A 25-second consumption stall caused by consumer-group rebalancing
-  was invisible from inside the process during benchmarking — it could only be
-  found in the broker log.
-- **ClickHouse schema is fixed** to the seven columns above.
+- **No latency measurement.** Throughput, drops, retries and rebalances are
+  exported; percentiles are not.
+- **No transformation language.** `schema = "json"` maps by column name and
+  nothing else; reshaping belongs in a ClickHouse materialized view.
+- **`json` mode has no startup schema validation**, unlike `event` mode.
 - **One source type.** Kafka only.
 - **No disk buffering.** Anything in flight when the process dies is replayed
   from Kafka, which is correct for at-least-once but means no durability beyond
