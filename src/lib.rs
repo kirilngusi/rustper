@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod event;
+pub mod metrics;
 pub mod sink;
 pub mod source;
 pub mod topology;

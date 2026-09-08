@@ -16,8 +16,12 @@ use tracing::{info, warn};
 use crate::{
     config::{DeliverySettings, SinkConfig},
     event::EventBatch,
+    metrics::SinkMetrics,
     topology::SinkEnvelope,
 };
+
+/// Relaxed ordering: these counters are statistics, never synchronisation.
+const ORDER: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
 
 #[async_trait]
 pub trait Sink: Send + Sync + 'static {
@@ -27,7 +31,28 @@ pub trait Sink: Send + Sync + 'static {
     ///
     /// Takes `&self` so a sink can have several writes in flight at once; any
     /// per-write mutable state belongs inside the implementation.
-    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<()>;
+    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<WriteOutcome>;
+}
+
+/// What a write actually did.
+///
+/// Returned rather than counted in place so sinks hold no metrics state and
+/// stay testable on their own; [`run`] folds the outcome into the counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub written: u64,
+    /// Rows the sink refused. These are acknowledged, not retried: the batch
+    /// succeeded, and a malformed row would fail again on every replay.
+    pub dropped: u64,
+}
+
+impl WriteOutcome {
+    pub fn written(written: u64) -> Self {
+        Self {
+            written,
+            dropped: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -54,12 +79,14 @@ async fn write_with_retry(
     sink: &dyn Sink,
     batches: &[Arc<EventBatch>],
     settings: DeliverySettings,
-) -> Result<()> {
+    metrics: &SinkMetrics,
+) -> Result<WriteOutcome> {
     let mut backoff = settings.retry_initial_backoff;
     for attempt in 1..=settings.retry_max_attempts {
         match sink.write_batches(batches).await {
-            Ok(()) => return Ok(()),
+            Ok(outcome) => return Ok(outcome),
             Err(error) if attempt < settings.retry_max_attempts => {
+                metrics.retries.fetch_add(1, ORDER);
                 warn!(
                     component = sink.name(),
                     attempt,
@@ -71,7 +98,10 @@ async fn write_with_retry(
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(settings.retry_max_backoff);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                metrics.write_errors.fetch_add(1, ORDER);
+                return Err(error);
+            }
         }
     }
     unreachable!("retry_max_attempts is at least 1")
@@ -88,6 +118,7 @@ async fn reap(writes: &mut JoinSet<Result<()>>) -> Result<()> {
 pub async fn run(
     sink: Box<dyn Sink>,
     settings: DeliverySettings,
+    metrics: Arc<crate::metrics::Metrics>,
     mut input: mpsc::Receiver<SinkEnvelope>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -97,6 +128,7 @@ pub async fn run(
         "sink started",
     );
     let sink: Arc<dyn Sink> = Arc::from(sink);
+    let component: Arc<str> = Arc::from(sink.name());
     let batching = sink.batch_settings();
     let mut writes: JoinSet<Result<()>> = JoinSet::new();
     // One timer reused for every coalescing window, rather than a fresh timeout
@@ -144,14 +176,27 @@ pub async fn run(
             reap(&mut writes).await?;
         }
 
+        // Queue depth is sampled here rather than tracked on every send: this is
+        // the point where a backed-up sink actually shows up.
+        metrics
+            .sink(&component)
+            .queue_depth
+            .store(input.len() as u64, ORDER);
+
         let sink = Arc::clone(&sink);
+        let metrics = Arc::clone(&metrics);
+        let component = Arc::clone(&component);
         writes.spawn(async move {
             let batches: Vec<Arc<EventBatch>> = envelopes
                 .iter()
                 .map(|envelope| Arc::clone(envelope.batch()))
                 .collect();
-            match write_with_retry(sink.as_ref(), &batches, settings).await {
-                Ok(()) => {
+            let counters = metrics.sink(&component);
+            match write_with_retry(sink.as_ref(), &batches, settings, counters).await {
+                Ok(outcome) => {
+                    counters.events_out.fetch_add(outcome.written, ORDER);
+                    counters.events_dropped.fetch_add(outcome.dropped, ORDER);
+                    counters.batches_written.fetch_add(1, ORDER);
                     envelopes.into_iter().for_each(SinkEnvelope::delivered);
                     Ok(())
                 }
@@ -186,9 +231,10 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    use super::{BatchSettings, Sink, write_with_retry};
+    use super::{BatchSettings, Sink, WriteOutcome, write_with_retry};
     use crate::config::DeliverySettings;
     use crate::event::{Event, EventBatch, SourceMetadata};
+    use crate::metrics::SinkMetrics;
     use std::time::Duration;
 
     struct FlakySink {
@@ -209,13 +255,15 @@ mod tests {
                 linger: Duration::ZERO,
             }
         }
-        async fn write_batches(&self, _: &[Arc<EventBatch>]) -> Result<()> {
+        async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<WriteOutcome> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until {
                 bail!("transient failure {attempt}");
             }
             self.released.notify_one();
-            Ok(())
+            Ok(WriteOutcome::written(
+                batches.iter().map(|b| b.len() as u64).sum(),
+            ))
         }
     }
 
@@ -249,10 +297,18 @@ mod tests {
             fail_until: 2,
             released: Notify::new(),
         };
-        write_with_retry(&sink, &batch(), settings(5))
+        let counters = SinkMetrics::default();
+        let outcome = write_with_retry(&sink, &batch(), settings(5), &counters)
             .await
             .unwrap();
         assert_eq!(sink.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome, WriteOutcome::written(1));
+        assert_eq!(
+            counters.retries.load(Ordering::SeqCst),
+            2,
+            "each retried attempt is counted",
+        );
+        assert_eq!(counters.write_errors.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -262,10 +318,17 @@ mod tests {
             fail_until: usize::MAX,
             released: Notify::new(),
         };
-        let error = write_with_retry(&sink, &batch(), settings(3))
+        let counters = SinkMetrics::default();
+        let error = write_with_retry(&sink, &batch(), settings(3), &counters)
             .await
             .unwrap_err();
         assert_eq!(sink.attempts.load(Ordering::SeqCst), 3);
         assert!(error.to_string().contains("transient failure 3"));
+        assert_eq!(counters.retries.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            counters.write_errors.load(Ordering::SeqCst),
+            1,
+            "the final failure is counted once, not once per attempt",
+        );
     }
 }

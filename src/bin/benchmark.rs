@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use rustper::{
     config::DeliverySettings,
     event::{BatchBuffer, Event, EventBatch, SourceMetadata},
-    sink::{BatchSettings, Sink},
+    metrics::Metrics,
+    sink::{BatchSettings, Sink, WriteOutcome},
     topology::Fanout,
 };
 use tokio::sync::mpsc;
@@ -63,13 +64,15 @@ impl Sink for CountingSink {
         }
     }
 
-    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<()> {
+    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<WriteOutcome> {
         for batch in batches {
             self.events.fetch_add(batch.len() as u64, Ordering::Relaxed);
             self.bytes
                 .fetch_add(batch.bytes() as u64, Ordering::Relaxed);
         }
-        Ok(())
+        Ok(WriteOutcome::written(
+            batches.iter().map(|batch| batch.len() as u64).sum(),
+        ))
     }
 }
 
@@ -89,6 +92,8 @@ async fn main() -> Result<()> {
     let events = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
     let shutdown = CancellationToken::new();
+    let sink_ids: Vec<String> = (0..OUTPUT_COUNT).map(|i| format!("sink-{i}")).collect();
+    let metrics = Metrics::new(["bench"], sink_ids.iter().map(String::as_str));
 
     let mut destinations = Vec::with_capacity(OUTPUT_COUNT);
     let mut workers = Vec::with_capacity(OUTPUT_COUNT);
@@ -107,8 +112,9 @@ async fn main() -> Result<()> {
             retry_max_backoff: Duration::from_millis(1),
         };
         let token = shutdown.child_token();
+        let metrics = Arc::clone(&metrics);
         workers.push(tokio::spawn(async move {
-            rustper::sink::run(sink, settings, rx, token).await
+            rustper::sink::run(sink, settings, metrics, rx, token).await
         }));
     }
     let fanout = Fanout::new(destinations);

@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::{config::Config, event::EventBatch, sink, source};
+use crate::{config::Config, event::EventBatch, metrics::Metrics, sink, source};
 
 pub struct SinkEnvelope {
     batch: Arc<EventBatch>,
@@ -136,6 +136,10 @@ async fn first_failure(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
 pub async fn run(config: Config) -> Result<()> {
     config.validate()?;
     let shutdown = CancellationToken::new();
+    let metrics = Metrics::new(
+        config.sources.keys().map(String::as_str),
+        config.sinks.keys().map(String::as_str),
+    );
     let mut sink_tasks = JoinSet::new();
     let mut sink_inputs = HashMap::new();
 
@@ -146,7 +150,9 @@ pub async fn run(config: Config) -> Result<()> {
         let component = sink::build(id, sink_config)?;
         let settings = sink_config.runtime_settings();
         let token = shutdown.child_token();
-        sink_tasks.spawn(async move { sink::run(component, settings, rx, token).await });
+        let sink_metrics = Arc::clone(&metrics);
+        sink_tasks
+            .spawn(async move { sink::run(component, settings, sink_metrics, rx, token).await });
     }
 
     let mut source_tasks = JoinSet::new();
@@ -157,12 +163,31 @@ pub async fn run(config: Config) -> Result<()> {
             .filter(|(_, sink)| sink.inputs().iter().any(|input| input == id))
             .map(|(sink_id, _)| sink_inputs[sink_id].clone())
             .collect();
-        let component = source::build(id, source_config)?;
+        let component = source::build(id, source_config, Arc::clone(&metrics))?;
         let fanout = Fanout::new(destinations);
         let token = shutdown.child_token();
         source_tasks.spawn(async move { component.run(fanout, token).await });
     }
     drop(sink_inputs);
+
+    // Reporting is spawned outside the source/sink JoinSets: a failure to bind
+    // the metrics port should not be mistaken for a pipeline failure, and the
+    // reporter must keep running while sinks drain.
+    let mut observability = JoinSet::new();
+    observability.spawn(crate::metrics::report(
+        Arc::clone(&metrics),
+        config.metrics.log_interval(),
+        shutdown.child_token(),
+    ));
+    if let Some(address) = config.metrics.listen {
+        let metrics = Arc::clone(&metrics);
+        let token = shutdown.child_token();
+        observability.spawn(async move {
+            if let Err(error) = crate::metrics::serve(metrics, address, token).await {
+                tracing::error!(%error, "metrics endpoint stopped");
+            }
+        });
+    }
 
     let outcome = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -178,6 +203,7 @@ pub async fn run(config: Config) -> Result<()> {
     // Sinks are given the chance to finish their in-flight writes; their
     // acknowledgements are what keep the at-least-once contract honest.
     let drained = join_all(&mut sink_tasks).await;
+    observability.shutdown().await;
     outcome.and(drained)
 }
 

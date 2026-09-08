@@ -1,12 +1,45 @@
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{collections::HashMap, fs, net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub sources: HashMap<String, SourceConfig>,
     pub sinks: HashMap<String, SinkConfig>,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Seconds between log lines. `0` disables the log reporter.
+    ///
+    /// This is the fallback for anyone without a Prometheus scraper, so it is
+    /// on by default: a router that silently drops rows is worse than a noisy
+    /// one.
+    #[serde(default = "default_log_interval_seconds")]
+    pub log_interval_seconds: u64,
+    /// Address for the `/metrics` endpoint. Absent means no listener at all.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            log_interval_seconds: default_log_interval_seconds(),
+            listen: None,
+        }
+    }
+}
+
+impl MetricsConfig {
+    pub fn log_interval(&self) -> Duration {
+        Duration::from_secs(self.log_interval_seconds)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,6 +205,9 @@ macro_rules! delivery_settings {
     };
 }
 
+fn default_log_interval_seconds() -> u64 {
+    10
+}
 fn default_session_timeout_ms() -> u64 {
     // Kafka's own default. A 10 s timeout looks harmless but makes the broker
     // fence the consumer whenever a heartbeat is delayed by a saturated

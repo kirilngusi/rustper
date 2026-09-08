@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rdkafka::{
-    ClientConfig, Message,
-    consumer::{CommitMode, Consumer, StreamConsumer},
+    ClientConfig, ClientContext, Message,
+    consumer::{CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer},
     message::BorrowedMessage,
     topic_partition_list::{Offset, TopicPartitionList},
 };
@@ -19,18 +19,56 @@ use tracing::info;
 use crate::{
     config::KafkaSourceConfig,
     event::{BatchBuffer, Event, EventBatch, SourceMetadata},
+    metrics::{Metrics, SourceMetrics},
     source::Source,
     topology::Fanout,
 };
 
+/// Relaxed ordering: these counters are statistics, never synchronisation.
+const ORDER: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
+
+/// Counts rebalances, which are otherwise invisible from inside the process.
+///
+/// A rebalance stops consumption for seconds at a time. During benchmarking a
+/// 25-second stall could only be attributed by reading the broker log, because
+/// nothing in the router knew it had been fenced and re-joined.
+pub struct MetricsContext {
+    metrics: Arc<Metrics>,
+    component: Arc<str>,
+}
+
+impl ClientContext for MetricsContext {}
+
+impl ConsumerContext for MetricsContext {
+    fn post_rebalance(&self, _: &rdkafka::consumer::BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        // Only the assignment half is counted; every rebalance produces exactly
+        // one, so counting both would double every event.
+        if let Rebalance::Assign(partitions) = rebalance {
+            self.metrics
+                .source(&self.component)
+                .rebalances
+                .fetch_add(1, ORDER);
+            tracing::warn!(
+                component = %self.component,
+                partitions = partitions.count(),
+                "consumer group rebalanced; consumption stalls while this happens",
+            );
+        }
+    }
+}
+
+type MeteredConsumer = StreamConsumer<MetricsContext>;
+
 pub struct KafkaSource {
     id: Arc<str>,
     config: KafkaSourceConfig,
-    consumer: StreamConsumer,
+    consumer: MeteredConsumer,
+    metrics: Arc<Metrics>,
 }
 
 impl KafkaSource {
-    pub fn new(id: &str, config: &KafkaSourceConfig) -> Result<Self> {
+    pub fn new(id: &str, config: &KafkaSourceConfig, metrics: Arc<Metrics>) -> Result<Self> {
+        let component: Arc<str> = Arc::from(id);
         let mut client = ClientConfig::new();
         client
             .set("bootstrap.servers", &config.brokers)
@@ -50,15 +88,21 @@ impl KafkaSource {
         for (key, value) in &config.client_config {
             client.set(key, value);
         }
-        let consumer: StreamConsumer = client.create().context("cannot create Kafka source")?;
+        let consumer: MeteredConsumer = client
+            .create_with_context(MetricsContext {
+                metrics: Arc::clone(&metrics),
+                component: Arc::clone(&component),
+            })
+            .context("cannot create Kafka source")?;
         let topics: Vec<&str> = config.topics.iter().map(String::as_str).collect();
         consumer
             .subscribe(&topics)
             .context("cannot subscribe to Kafka topics")?;
         Ok(Self {
-            id: Arc::from(id),
+            id: component,
             config: config.clone(),
             consumer,
+            metrics,
         })
     }
 }
@@ -151,21 +195,25 @@ fn offsets_for(events: &[Event]) -> Result<TopicPartitionList> {
 }
 
 fn commit_contiguous(
-    consumer: &StreamConsumer,
+    consumer: &MeteredConsumer,
     completed: &mut BTreeMap<u64, BatchCompletion>,
     next_sequence: &mut u64,
     completion: BatchCompletion,
-) -> Result<u64> {
+    counters: &SourceMetrics,
+) -> Result<(u64, u64)> {
     completed.insert(completion.sequence, completion);
     let mut committed_events = 0;
+    let mut committed_bytes = 0;
     while let Some(completion) = completed.remove(next_sequence) {
         consumer
             .commit(&completion.offsets, CommitMode::Async)
             .context("cannot commit Kafka batch")?;
         committed_events += completion.events;
+        committed_bytes += completion.bytes as u64;
+        counters.commits.fetch_add(1, ORDER);
         *next_sequence += 1;
     }
-    Ok(committed_events)
+    Ok((committed_events, committed_bytes))
 }
 
 /// Reports throughput over the interval since the previous report, not as a
@@ -223,6 +271,7 @@ impl Source for KafkaSource {
         let batch_size = self.config.batch_size;
         let linger = Duration::from_millis(self.config.batch_linger_ms);
 
+        let counters = self.metrics.source(&self.id);
         let mut processed = 0_u64;
         let mut reporter = ThroughputReporter::new(Arc::clone(&self.id), REPORT_EVERY);
         let mut topics = TopicCache::default();
@@ -254,6 +303,13 @@ impl Source for KafkaSource {
                     let event_count = batch.len() as u64;
                     let event_bytes = batch.bytes();
                     in_flight_bytes = in_flight_bytes.saturating_add(event_bytes);
+                    counters.batches_in.fetch_add(1, ORDER);
+                    counters
+                        .in_flight_bytes
+                        .store(in_flight_bytes as u64, ORDER);
+                    counters
+                        .in_flight_batches
+                        .store(in_flight.len() as u64 + 1, ORDER);
                     let batch_sequence = sequence;
                     sequence += 1;
                     let fanout = output.clone();
@@ -288,10 +344,17 @@ impl Source for KafkaSource {
                     let completion = joined.expect("in-flight set is not empty")
                         .context("fan-out task panicked")??;
                     in_flight_bytes = in_flight_bytes.saturating_sub(completion.bytes);
-                    let committed = commit_contiguous(
+                    counters.in_flight_bytes.store(in_flight_bytes as u64, ORDER);
+                    counters.in_flight_batches.store(in_flight.len() as u64, ORDER);
+                    let (committed, committed_bytes) = commit_contiguous(
                         &self.consumer, &mut completed, &mut next_commit_sequence, completion,
+                        counters,
                     )?;
                     processed += committed;
+                    // Counted at commit rather than at consume: an event only
+                    // really made it once every sink acknowledged it.
+                    counters.events_in.fetch_add(committed, ORDER);
+                    counters.bytes_in.fetch_add(committed_bytes, ORDER);
                     reporter.record(committed, processed);
                 },
 

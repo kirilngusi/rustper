@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use crate::{
     config::KafkaSinkConfig,
     event::EventBatch,
-    sink::{BatchSettings, Sink},
+    sink::{BatchSettings, Sink, WriteOutcome},
 };
 
 /// How long to wait before re-offering a record librdkafka refused because its
@@ -152,10 +152,10 @@ impl Sink for KafkaSink {
         self.batch
     }
 
-    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<()> {
+    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<WriteOutcome> {
         let total: usize = batches.iter().map(|batch| batch.len()).sum();
         if total == 0 {
-            return Ok(());
+            return Ok(WriteOutcome::default());
         }
         let (tracker, done) = BatchTracker::new(total);
         let enqueue_deadline = tokio::time::Instant::now() + self.enqueue_timeout;
@@ -210,7 +210,7 @@ impl Sink for KafkaSink {
         }
         match tracker.take_error() {
             Some(error) => Err(anyhow!(error).context("Kafka delivery failed")),
-            None => Ok(()),
+            None => Ok(WriteOutcome::written(total as u64)),
         }
     }
 }

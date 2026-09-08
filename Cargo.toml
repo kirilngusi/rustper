@@ -17,10 +17,17 @@ async-trait = "0.1"
 bytes = "1.10"
 clickhouse = "0.15.1"
 futures = "0.3"
+# Already compiled into every build as a transitive dependency of `clickhouse`;
+# promoted to a direct dependency to serve the metrics endpoint.
+http-body-util = "0.1"
+hyper = { version = "1.11", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# "net" and "io-util" back the metrics listener; they were previously enabled
+# only as a side effect of hyper-util turning them on.
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 toml = "0.9"
 tracing = "0.1"

@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use rustper::{
     config::DeliverySettings,
     event::{Event, EventBatch, SourceMetadata},
-    sink::{BatchSettings, Sink},
+    metrics::Metrics,
+    sink::{BatchSettings, Sink, WriteOutcome},
     topology::{Fanout, SinkEnvelope},
 };
 use tokio::sync::mpsc;
@@ -38,7 +39,7 @@ impl Sink for TestSink {
         self.settings
     }
 
-    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<()> {
+    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<WriteOutcome> {
         let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         if write <= self.fail_first {
             bail!("injected failure on write {write}");
@@ -46,7 +47,9 @@ impl Sink for TestSink {
         for batch in batches {
             self.events.fetch_add(batch.len() as u64, Ordering::SeqCst);
         }
-        Ok(())
+        Ok(WriteOutcome::written(
+            batches.iter().map(|batch| batch.len() as u64).sum(),
+        ))
     }
 }
 
@@ -84,6 +87,8 @@ struct RunningSink {
     input: mpsc::Sender<SinkEnvelope>,
     events: Arc<AtomicU64>,
     writes: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
+    id: String,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -110,11 +115,18 @@ fn spawn_sink(
     });
     let token = CancellationToken::new();
     let child = token.child_token();
-    let task = tokio::spawn(async move { rustper::sink::run(sink, delivery, rx, child).await });
+    let metrics = Metrics::new(["source"], [id]);
+    let sink_metrics = Arc::clone(&metrics);
+    let task =
+        tokio::spawn(
+            async move { rustper::sink::run(sink, delivery, sink_metrics, rx, child).await },
+        );
     RunningSink {
         input: tx,
         events,
         writes,
+        metrics,
+        id: id.to_owned(),
         shutdown: token,
         task,
     }
@@ -196,6 +208,46 @@ async fn coalescing_merges_queued_batches_into_one_write() {
         "batches must coalesce, saw {} writes",
         sink.writes.load(Ordering::SeqCst),
     );
+}
+
+#[tokio::test]
+async fn counters_track_writes_retries_and_failures_through_the_runtime() {
+    let sink = spawn_sink("counted", 2, settings(5), Duration::from_millis(1));
+    let fanout = Fanout::new(vec![sink.input.clone()]);
+
+    fanout.send(batch(6, 0)).await.unwrap();
+
+    sink.shutdown.cancel();
+    sink.task.await.unwrap().unwrap();
+
+    let counters = sink.metrics.sink(&sink.id);
+    assert_eq!(counters.events_out.load(Ordering::SeqCst), 6);
+    assert_eq!(counters.batches_written.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counters.retries.load(Ordering::SeqCst),
+        2,
+        "two injected failures were retried",
+    );
+    assert_eq!(counters.write_errors.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.events_dropped.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_unrecoverable_failure_is_counted_and_nothing_is_reported_written() {
+    let sink = spawn_sink("counted_bad", usize::MAX, settings(2), Duration::ZERO);
+    let fanout = Fanout::new(vec![sink.input.clone()]);
+
+    assert!(fanout.send(batch(4, 0)).await.is_err());
+    assert!(sink.task.await.unwrap().is_err());
+
+    let counters = sink.metrics.sink(&sink.id);
+    assert_eq!(counters.write_errors.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counters.events_out.load(Ordering::SeqCst),
+        0,
+        "a failed write must not inflate the written count",
+    );
+    assert_eq!(counters.batches_written.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

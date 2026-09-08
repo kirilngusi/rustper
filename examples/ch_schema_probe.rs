@@ -82,9 +82,12 @@ async fn main() -> std::process::ExitCode {
     };
 
     match sink.write_batches(&[probe_batch()]).await {
-        Ok(()) => {
-            println!("OK: {table:?} accepts the sink's schema.");
-            println!("Wrote one probe row (source_offset = 99); delete it when done.");
+        Ok(outcome) => {
+            println!(
+                "OK: {table:?} accepts the sink's schema ({} row written, {} dropped).",
+                outcome.written, outcome.dropped,
+            );
+            println!("Delete the probe row (source_offset = 99) when done.");
             std::process::ExitCode::SUCCESS
         }
         Err(error) => {

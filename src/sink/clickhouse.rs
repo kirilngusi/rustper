@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::{
     config::ClickhouseSinkConfig,
     event::EventBatch,
-    sink::{BatchSettings, Sink},
+    sink::{BatchSettings, Sink, WriteOutcome},
 };
 
 #[derive(Row, Serialize)]
@@ -63,12 +63,13 @@ impl Sink for ClickhouseSink {
         self.batch
     }
 
-    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<()> {
+    async fn write_batches(&self, batches: &[Arc<EventBatch>]) -> Result<WriteOutcome> {
         let mut insert = self
             .client
             .insert::<EventRow<'_>>(&self.table)
             .await
             .with_context(|| format!("ClickHouse insert into {:?} failed", self.table))?;
+        let mut written = 0_u64;
         for event in batches.iter().flat_map(|batch| batch.events()) {
             let row = EventRow {
                 timestamp_ms: event.timestamp_ms.unwrap_or_default(),
@@ -83,8 +84,9 @@ impl Sink for ClickhouseSink {
                 .write(&row)
                 .await
                 .context("cannot encode ClickHouse row")?;
+            written += 1;
         }
         insert.end().await.context("ClickHouse rejected batch")?;
-        Ok(())
+        Ok(WriteOutcome::written(written))
     }
 }
